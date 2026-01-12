@@ -184,6 +184,7 @@ restore_config() {
     echo "Reading database and rewriting nftables config file..."
     apply_rules
 }
+
 # Main Menu
 enable_forwarding
 while true; do

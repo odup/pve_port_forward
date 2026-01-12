@@ -184,6 +184,7 @@ restore_config() {
     echo "正在读取数据库并重写 nftables 配置文件..."
     apply_rules
 }
+
 # 主菜单
 enable_forwarding
 while true; do
