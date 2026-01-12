@@ -32,6 +32,7 @@ enable_forwarding() {
 
 # 核心函数：根据数据库生成 nftables 配置并应用
 apply_rules() {
+    # 开始生成配置文件（这将覆盖原有的 nftables.conf）
     cat > "$NFT_CONF" <<EOF
 #!/usr/sbin/nft -f
 
@@ -168,6 +169,21 @@ del_rule() {
     fi
 }
 
+# 4. 恢复/重载配置 (新功能)
+restore_config() {
+    echo -e "\n${YELLOW}>>> 正在恢复配置...${NC}"
+    
+    # 检查数据库是否有内容
+    if [ ! -s "$DB_FILE" ]; then
+        echo -e "${RED}错误：数据库文件 (/etc/nat_rules.db) 为空或不存在，无法恢复。${NC}"
+        echo -e "请先添加至少一条规则。"
+        return
+    fi
+    
+    # 强制调用 apply_rules 进行重写和重启
+    echo "正在读取数据库并重写 nftables 配置文件..."
+    apply_rules
+}
 # 主菜单
 enable_forwarding
 while true; do
@@ -175,14 +191,16 @@ while true; do
     echo "1. 查看当前规则"
     echo "2. 添加转发规则"
     echo "3. 删除转发规则"
-    echo "4. 退出"
-    read -p "请输入选项 [1-4]: " choice
+    echo "4. 恢复/重载配置"
+    echo "5. 退出"
+    read -p "请输入选项 [1-5]: " choice
 
     case $choice in
         1) list_rules ;;
         2) add_rule ;;
         3) del_rule ;;
-        4) exit 0 ;;
+        4) restore_config ;;
+        5) exit 0 ;;
         *) echo "无效输入" ;;
     esac
 done

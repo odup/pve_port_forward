@@ -1,28 +1,28 @@
 #!/bin/bash
 
-# Configuration Paths
+# Configuration file paths
 DB_FILE="/etc/nat_rules.db"
 NFT_CONF="/etc/nftables.conf"
 
-# Color Definitions
+# Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Check for Root Privileges
+# Check Root privileges
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}Error: Please run this script with sudo!${NC}"
+  echo -e "${RED}Please run this script with sudo!${NC}"
   exit 1
 fi
 
-# Initialize Database File
+# Initialize database file
 if [ ! -f "$DB_FILE" ]; then
     touch "$DB_FILE"
 fi
 
-# Ensure Kernel IP Forwarding is Enabled
+# Ensure kernel forwarding is enabled
 enable_forwarding() {
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -30,8 +30,9 @@ enable_forwarding() {
     fi
 }
 
-# Core Function: Generate and Apply nftables Configuration
+# Core function: Generate nftables config from DB and apply
 apply_rules() {
+    # Start generating config file (This will overwrite existing nftables.conf)
     cat > "$NFT_CONF" <<EOF
 #!/usr/sbin/nft -f
 
@@ -42,17 +43,17 @@ table ip nat {
         type nat hook prerouting priority dstnat; policy accept;
 EOF
 
-    # Read Database and Write DNAT Rules
+    # Read database and write DNAT rules
     # Format: lport|backend_ip|backend_port|proto|remark
     while IFS='|' read -r lport backend_ip backend_port proto remark; do
         if [[ -n "$lport" ]]; then
             # Handle empty remarks
             remark_text=${remark:-None}
             
-            # Add comment in config file for debugging
+            # Add comments to config file for debugging
             echo "        # Remark: $remark_text" >> "$NFT_CONF"
 
-            # Write Rules
+            # Write rules
             if [ "$proto" == "tcp+udp" ]; then
                 echo "        tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 echo "        udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
@@ -68,7 +69,7 @@ EOF
 
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # NO MASQUERADE executed here to preserve Source IP
+        # No Masquerade, preserve source IP
     }
 }
 
@@ -76,13 +77,13 @@ table ip filter {
     chain input { type filter hook input priority 0; policy accept; }
     chain forward { 
         type filter hook forward priority 0; policy accept; 
-        # Accept all forwarded traffic
+        # Allow all forwarded traffic
     }
     chain output { type filter hook output priority 0; policy accept; }
 }
 EOF
 
-    # Restart nftables to Apply Changes
+    # Restart nftables to apply config
     systemctl enable nftables > /dev/null 2>&1
     systemctl restart nftables
     
@@ -93,33 +94,33 @@ EOF
     fi
 }
 
-# 1. List Rules
+# 1. List rules
 list_rules() {
     echo -e "\n${CYAN}=== Current Forwarding Rules ===${NC}"
     if [ ! -s "$DB_FILE" ]; then
         echo "No rules found."
     else
-        # Adjusted column widths for English headers
-        printf "${YELLOW}%-4s %-10s %-12s %-18s %-12s %-s${NC}\n" "ID" "Proto" "Local Port" "Dest IP" "Dest Port" "Remark"
+        # Adjust header, add remark column
+        printf "${YELLOW}%-4s %-10s %-10s %-18s %-10s %-s${NC}\n" "ID" "Proto" "L-Port" "Dest IP" "Dest Port" "Remark"
         echo "--------------------------------------------------------------------------------"
         i=1
         while IFS='|' read -r lport backend_ip backend_port proto remark; do
-            # Display '-' if remark is empty
+            # If remark is empty, show -
             safe_remark=${remark:-"-"}
-            printf "%-4s %-10s %-12s %-18s %-12s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
+            printf "%-4s %-10s %-10s %-18s %-10s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
             ((i++))
         done < "$DB_FILE"
     fi
-    echo "================================"
+    echo "======================"
 }
 
-# 2. Add Rule
+# 2. Add rule
 add_rule() {
     echo -e "\n${GREEN}>>> Add New Forwarding Rule${NC}"
     
     read -p "Local Listening Port (e.g., 8080): " lport
-    read -p "Destination IP (e.g., 192.168.1.20): " backend_ip
-    read -p "Destination Port (e.g., 80): " backend_port
+    read -p "Backend Real IP (e.g., 192.168.1.20): " backend_ip
+    read -p "Backend Real Port (e.g., 80): " backend_port
     
     echo "Protocol Type:"
     echo "1) TCP"
@@ -134,23 +135,23 @@ add_rule() {
         *) echo -e "${RED}Invalid selection${NC}"; return ;;
     esac
 
-    # Input Remark
-    read -p "Remark/Comment (Optional, no '|' char): " user_remark
-    # Remove pipe character to prevent DB corruption
+    # Input remark
+    read -p "Remark (Optional, do not use '|'): " user_remark
+    # Remove pipe characters that might break formatting
     user_remark=${user_remark//|/}
 
-    # Simple Conflict Check
+    # Simple duplicate check
     if grep -q "^$lport|" "$DB_FILE"; then
-        echo -e "${RED}Error: Rule for local port $lport already exists. Please delete it first.${NC}"
+        echo -e "${RED}Error: Rule for local port $lport already exists. Please delete the old rule first.${NC}"
         return
     fi
 
-    # Write to File: lport|backend_ip|backend_port|proto|remark
+    # Write to file: lport|backend_ip|backend_port|proto|remark
     echo "$lport|$backend_ip|$backend_port|$proto|$user_remark" >> "$DB_FILE"
     apply_rules
 }
 
-# 3. Delete Rule
+# 3. Delete rule
 del_rule() {
     list_rules
     if [ ! -s "$DB_FILE" ]; then return; fi
@@ -168,21 +169,38 @@ del_rule() {
     fi
 }
 
+# 4. Restore/Reload Configuration (New Feature)
+restore_config() {
+    echo -e "\n${YELLOW}>>> Restoring configuration...${NC}"
+    
+    # Check if database has content
+    if [ ! -s "$DB_FILE" ]; then
+        echo -e "${RED}Error: Database file (/etc/nat_rules.db) is empty or missing, cannot restore.${NC}"
+        echo -e "Please add at least one rule first."
+        return
+    fi
+    
+    # Force call apply_rules to rewrite and restart
+    echo "Reading database and rewriting nftables config file..."
+    apply_rules
+}
 # Main Menu
 enable_forwarding
 while true; do
-    echo -e "\n${CYAN}PVE/Debian Transparent Port Forwarding (No-SNAT)${NC}"
-    echo "1. List Rules"
-    echo "2. Add Rule"
-    echo "3. Delete Rule"
-    echo "4. Exit"
-    read -p "Enter option [1-4]: " choice
+    echo -e "\n${CYAN}PVE Transparent Forwarding Manager - based on nftables${NC}"
+    echo "1. List Current Rules"
+    echo "2. Add Forwarding Rule"
+    echo "3. Delete Forwarding Rule"
+    echo "4. Restore/Reload Configuration"
+    echo "5. Exit"
+    read -p "Enter option [1-5]: " choice
 
     case $choice in
         1) list_rules ;;
         2) add_rule ;;
         3) del_rule ;;
-        4) exit 0 ;;
+        4) restore_config ;;
+        5) exit 0 ;;
         *) echo "Invalid input" ;;
     esac
 done

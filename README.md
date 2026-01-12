@@ -91,6 +91,7 @@ chmod +x pve_port_forward_zh.sh
 
 
 * **删除规则**：根据 ID 删除。
+* **恢复/重载配置**：迁移或修改 nat_rules.db 文件后的恢复
 
 ---
 
@@ -196,6 +197,7 @@ chmod +x pve_port_forward_en.sh
 
 
 * **Delete Rule**: Remove rules by ID.
+* **Restore/Reload Configuration**：Restoration after migrating or modifying the nat_rules.db file.
 
 ---
 
