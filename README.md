@@ -66,17 +66,17 @@
 
 #### 1. 安装脚本
 
-将 `pve_port_forward_zh.sh` 上传至 PVE Shell。
+将 `pve_port_forward_cn.sh` 上传至 PVE Shell。
 
 ```bash
-chmod +x pve_port_forward_zh.sh
+chmod +x pve_port_forward_cn.sh
 
 ```
 
 #### 2. 运行管理界面
 
 ```bash
-./pve_port_forward_zh.sh
+./pve_port_forward_cn.sh
 
 ```
 
