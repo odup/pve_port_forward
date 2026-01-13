@@ -90,6 +90,7 @@ chmod +x pve_port_forward_cn.sh
 * 输入备注（如：`CT_101_Web`）。
 
 
+* **暂停/开启规则**：暂停转发但不删除记录，可以再次开启。
 * **删除规则**：根据 ID 删除。
 * **恢复/重载配置**：迁移或修改 nat_rules.db 文件后的恢复
 
@@ -196,6 +197,7 @@ chmod +x pve_port_forward_en.sh
 * Input Remark (e.g., `CT_101_Web`).
 
 
+* **Pause/Enable Rules**：Pausing forwarding without deleting records allows you to resume it later.
 * **Delete Rule**: Remove rules by ID.
 * **Restore/Reload Configuration**：Restoration after migrating or modifying the nat_rules.db file.
 

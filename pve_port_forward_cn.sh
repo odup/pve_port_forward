@@ -44,23 +44,26 @@ table ip nat {
 EOF
 
     # 读取数据库并写入 DNAT 规则
-    # 格式: lport|backend_ip|backend_port|proto|remark
-    while IFS='|' read -r lport backend_ip backend_port proto remark; do
+    # 格式: lport|backend_ip|backend_port|proto|remark|status
+    # status: 1=启用, 0=暂停 (如果为空默认为1)
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
         if [[ -n "$lport" ]]; then
-            # 处理备注为空的情况
+            # 兼容旧数据，status 为空则默认为 1 (开启)
+            current_status=${status:-1}
             remark_text=${remark:-无}
-            
-            # 在配置文件中添加注释，方便调试
-            echo "        # 备注: $remark_text" >> "$NFT_CONF"
 
-            # 写入规则
-            if [ "$proto" == "tcp+udp" ]; then
-                echo "        tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                echo "        udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-            else
-                echo "        $proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+            # 只有当状态为 1 时才写入配置
+            if [ "$current_status" == "1" ]; then
+                # 在配置文件中添加注释，方便调试
+                echo "        # 备注: $remark_text" >> "$NFT_CONF"
+                if [ "$proto" == "tcp+udp" ]; then
+                    echo "        tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                else
+                    echo "        $proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                fi
+                echo "" >> "$NFT_CONF"
             fi
-            echo "" >> "$NFT_CONF"
         fi
     done < "$DB_FILE"
 
@@ -94,20 +97,26 @@ EOF
     fi
 }
 
-# 1. 查看规则
+# 1. 查看所有规则
 list_rules() {
-    echo -e "\n${CYAN}=== 当前转发规则 ===${NC}"
+    echo -e "\n${CYAN}=== 当前规则列表 ===${NC}"
     if [ ! -s "$DB_FILE" ]; then
         echo "暂无规则。"
     else
-        # 调整表头，增加备注列
-        printf "${YELLOW}%-4s %-10s %-10s %-18s %-10s %-s${NC}\n" "ID" "协议" "本地端口" "目标IP" "目标端口" "备注"
-        echo "--------------------------------------------------------------------------------"
+        printf "${YELLOW}%-4s %-8s %-10s %-10s %-16s %-10s %-s${NC}\n" "ID" "状态" "协议" "本地端口" "目标IP" "目标端口" "备注"
+        echo "---------------------------------------------------------------------------------------"
         i=1
-        while IFS='|' read -r lport backend_ip backend_port proto remark; do
-            # 如果备注为空，显示 -
+        while IFS='|' read -r lport backend_ip backend_port proto remark status; do
             safe_remark=${remark:-"-"}
-            printf "%-4s %-10s %-10s %-18s %-10s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
+            current_status=${status:-1}
+            
+            if [ "$current_status" == "1" ]; then
+                status_str="${GREEN}开启${NC}"
+            else
+                status_str="${RED}暂停${NC}"
+            fi
+            
+            printf "%-4s %-14b %-10s %-10s %-16s %-10s %-s\n" "$i" "$status_str" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
             ((i++))
         done < "$DB_FILE"
     fi
@@ -135,7 +144,6 @@ add_rule() {
         *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
 
-    # 输入备注
     read -p "备注说明 (选填，勿包含'|'符号): " user_remark
     # 去除可能破坏格式的管道符
     user_remark=${user_remark//|/}
@@ -146,18 +154,103 @@ add_rule() {
         return
     fi
 
-    # 写入文件：本地端口|目标IP|目标端口|协议|备注
-    echo "$lport|$backend_ip|$backend_port|$proto|$user_remark" >> "$DB_FILE"
+    # 写入文件：本地端口|目标IP|目标端口|协议|备注|状态(默认1)
+    echo "$lport|$backend_ip|$backend_port|$proto|$user_remark|1" >> "$DB_FILE"
     apply_rules
 }
 
-# 3. 删除规则
+# 内部函数：暂停规则
+pause_rule_logic() {
+    echo -e "\n${CYAN}>>> 暂停转发规则${NC}"
+    echo -e "(仅显示当前正在【开启】的规则)"
+    
+    found=0
+    i=1
+    printf "${YELLOW}%-4s %-10s %-10s %-16s %-s${NC}\n" "ID" "协议" "本地端口" "目标IP" "备注"
+    echo "--------------------------------------------------------"
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
+        current_status=${status:-1}
+        if [ "$current_status" == "1" ]; then
+             printf "%-4s %-10s %-10s %-16s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "${remark:-"-"}"
+             found=1
+        fi
+        ((i++))
+    done < "$DB_FILE"
+
+    if [ $found -eq 0 ]; then
+        echo "没有正在开启的规则。"
+        return
+    fi
+
+    read -p "请输入要【暂停】的规则 ID: " target_id
+    
+    total_lines=$(wc -l < "$DB_FILE")
+    if [[ "$target_id" =~ ^[0-9]+$ ]] && [ "$target_id" -le "$total_lines" ] && [ "$target_id" -gt 0 ]; then
+        awk -v line="$target_id" -v FS="|" -v OFS="|" 'NR==line {$6="0"} {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+        echo -e "${YELLOW}规则 ID $target_id 已暂停。${NC}"
+        apply_rules
+    else
+        echo -e "${RED}无效的 ID${NC}"
+    fi
+}
+
+# 内部函数：开启规则
+enable_rule_logic() {
+    echo -e "\n${CYAN}>>> 开启转发规则${NC}"
+    echo -e "(仅显示当前已【暂停】的规则)"
+    
+    found=0
+    i=1
+    printf "${YELLOW}%-4s %-10s %-10s %-16s %-s${NC}\n" "ID" "协议" "本地端口" "目标IP" "备注"
+    echo "--------------------------------------------------------"
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
+        current_status=${status:-1}
+        if [ "$current_status" == "0" ]; then
+             printf "%-4s %-10s %-10s %-16s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "${remark:-"-"}"
+             found=1
+        fi
+        ((i++))
+    done < "$DB_FILE"
+
+    if [ $found -eq 0 ]; then
+        echo "没有已暂停的规则。"
+        return
+    fi
+
+    read -p "请输入要【开启】的规则 ID: " target_id
+    
+    total_lines=$(wc -l < "$DB_FILE")
+    if [[ "$target_id" =~ ^[0-9]+$ ]] && [ "$target_id" -le "$total_lines" ] && [ "$target_id" -gt 0 ]; then
+        awk -v line="$target_id" -v FS="|" -v OFS="|" 'NR==line {$6="1"} {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+        echo -e "${GREEN}规则 ID $target_id 已重新开启。${NC}"
+        apply_rules
+    else
+        echo -e "${RED}无效的 ID${NC}"
+    fi
+}
+
+# 3. 管理规则状态（二级菜单）
+manage_state() {
+    echo -e "\n${YELLOW}>>> 管理规则状态${NC}"
+    echo "1. 暂停规则"
+    echo "2. 开启规则"
+    echo "3. 返回上级菜单"
+    read -p "请选择操作 [1-3]: " sub_choice
+    
+    case $sub_choice in
+        1) pause_rule_logic ;;
+        2) enable_rule_logic ;;
+        3) return ;;
+        *) echo "无效输入" ;;
+    esac
+}
+
+# 4. 删除规则
 del_rule() {
     list_rules
     if [ ! -s "$DB_FILE" ]; then return; fi
     
     read -p "请输入要删除的规则 ID: " del_id
-    
     # 获取总行数
     total_lines=$(wc -l < "$DB_FILE")
     
@@ -169,17 +262,15 @@ del_rule() {
     fi
 }
 
-# 4. 恢复/重载配置 (新功能)
+# 5. 恢复/重载配置
 restore_config() {
     echo -e "\n${YELLOW}>>> 正在恢复配置...${NC}"
-    
     # 检查数据库是否有内容
     if [ ! -s "$DB_FILE" ]; then
         echo -e "${RED}错误：数据库文件 (/etc/nat_rules.db) 为空或不存在，无法恢复。${NC}"
         echo -e "请先添加至少一条规则。"
         return
     fi
-    
     # 强制调用 apply_rules 进行重写和重启
     echo "正在读取数据库并重写 nftables 配置文件..."
     apply_rules
@@ -188,20 +279,22 @@ restore_config() {
 # 主菜单
 enable_forwarding
 while true; do
-    echo -e "\n${CYAN}PVE 透明转发管理-基于nftables${NC}"
-    echo "1. 查看当前规则"
+    echo -e "\n${CYAN}PVE 透明转发管理 (nftables)${NC}"
+    echo "1. 查看所有规则"
     echo "2. 添加转发规则"
-    echo "3. 删除转发规则"
-    echo "4. 恢复/重载配置"
-    echo "5. 退出"
-    read -p "请输入选项 [1-5]: " choice
+    echo "3. 暂停/开启规则"
+    echo "4. 删除转发规则"
+    echo "5. 恢复/重载配置"
+    echo "6. 退出"
+    read -p "请输入选项 [1-6]: " choice
 
     case $choice in
         1) list_rules ;;
         2) add_rule ;;
-        3) del_rule ;;
-        4) restore_config ;;
-        5) exit 0 ;;
+        3) manage_state ;;
+        4) del_rule ;;
+        5) restore_config ;;
+        6) exit 0 ;;
         *) echo "无效输入" ;;
     esac
 done

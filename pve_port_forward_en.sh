@@ -44,23 +44,26 @@ table ip nat {
 EOF
 
     # Read database and write DNAT rules
-    # Format: lport|backend_ip|backend_port|proto|remark
-    while IFS='|' read -r lport backend_ip backend_port proto remark; do
+    # Format: lport|backend_ip|backend_port|proto|remark|status
+    # status: 1=Enabled, 0=Paused (defaults to 1 if empty)
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
         if [[ -n "$lport" ]]; then
-            # Handle empty remarks
+            # Backward compatibility: status defaults to 1 (Active) if empty
+            current_status=${status:-1}
             remark_text=${remark:-None}
-            
-            # Add comments to config file for debugging
-            echo "        # Remark: $remark_text" >> "$NFT_CONF"
 
-            # Write rules
-            if [ "$proto" == "tcp+udp" ]; then
-                echo "        tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                echo "        udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-            else
-                echo "        $proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+            # Only write to config if status is 1
+            if [ "$current_status" == "1" ]; then
+                # Add comment to config file for debugging
+                echo "        # Remark: $remark_text" >> "$NFT_CONF"
+                if [ "$proto" == "tcp+udp" ]; then
+                    echo "        tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                else
+                    echo "        $proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                fi
+                echo "" >> "$NFT_CONF"
             fi
-            echo "" >> "$NFT_CONF"
         fi
     done < "$DB_FILE"
 
@@ -94,20 +97,26 @@ EOF
     fi
 }
 
-# 1. List rules
+# 1. List all rules
 list_rules() {
-    echo -e "\n${CYAN}=== Current Forwarding Rules ===${NC}"
+    echo -e "\n${CYAN}=== Current Rules ===${NC}"
     if [ ! -s "$DB_FILE" ]; then
         echo "No rules found."
     else
-        # Adjust header, add remark column
-        printf "${YELLOW}%-4s %-10s %-10s %-18s %-10s %-s${NC}\n" "ID" "Proto" "L-Port" "Dest IP" "Dest Port" "Remark"
-        echo "--------------------------------------------------------------------------------"
+        printf "${YELLOW}%-4s %-8s %-10s %-10s %-16s %-10s %-s${NC}\n" "ID" "Status" "Proto" "L-Port" "Dest IP" "Dest Port" "Remark"
+        echo "---------------------------------------------------------------------------------------"
         i=1
-        while IFS='|' read -r lport backend_ip backend_port proto remark; do
-            # If remark is empty, show -
+        while IFS='|' read -r lport backend_ip backend_port proto remark status; do
             safe_remark=${remark:-"-"}
-            printf "%-4s %-10s %-10s %-18s %-10s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
+            current_status=${status:-1}
+            
+            if [ "$current_status" == "1" ]; then
+                status_str="${GREEN}Active${NC}"
+            else
+                status_str="${RED}Paused${NC}"
+            fi
+            
+            printf "%-4s %-14b %-10s %-10s %-16s %-10s %-s\n" "$i" "$status_str" "$proto" "$lport" "$backend_ip" "$backend_port" "$safe_remark"
             ((i++))
         done < "$DB_FILE"
     fi
@@ -135,7 +144,6 @@ add_rule() {
         *) echo -e "${RED}Invalid selection${NC}"; return ;;
     esac
 
-    # Input remark
     read -p "Remark (Optional, do not use '|'): " user_remark
     # Remove pipe characters that might break formatting
     user_remark=${user_remark//|/}
@@ -146,18 +154,103 @@ add_rule() {
         return
     fi
 
-    # Write to file: lport|backend_ip|backend_port|proto|remark
-    echo "$lport|$backend_ip|$backend_port|$proto|$user_remark" >> "$DB_FILE"
+    # Write to file: lport|backend_ip|backend_port|proto|remark|status(default 1)
+    echo "$lport|$backend_ip|$backend_port|$proto|$user_remark|1" >> "$DB_FILE"
     apply_rules
 }
 
-# 3. Delete rule
+# Internal function: Pause rule
+pause_rule_logic() {
+    echo -e "\n${CYAN}>>> Pause Forwarding Rule${NC}"
+    echo -e "(Showing only currently [Active] rules)"
+    
+    found=0
+    i=1
+    printf "${YELLOW}%-4s %-10s %-10s %-16s %-s${NC}\n" "ID" "Proto" "L-Port" "Dest IP" "Remark"
+    echo "--------------------------------------------------------"
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
+        current_status=${status:-1}
+        if [ "$current_status" == "1" ]; then
+             printf "%-4s %-10s %-10s %-16s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "${remark:-"-"}"
+             found=1
+        fi
+        ((i++))
+    done < "$DB_FILE"
+
+    if [ $found -eq 0 ]; then
+        echo "No active rules available to pause."
+        return
+    fi
+
+    read -p "Enter ID to [Pause]: " target_id
+    
+    total_lines=$(wc -l < "$DB_FILE")
+    if [[ "$target_id" =~ ^[0-9]+$ ]] && [ "$target_id" -le "$total_lines" ] && [ "$target_id" -gt 0 ]; then
+        awk -v line="$target_id" -v FS="|" -v OFS="|" 'NR==line {$6="0"} {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+        echo -e "${YELLOW}Rule ID $target_id has been paused.${NC}"
+        apply_rules
+    else
+        echo -e "${RED}Invalid ID${NC}"
+    fi
+}
+
+# Internal function: Resume rule
+enable_rule_logic() {
+    echo -e "\n${CYAN}>>> Resume Forwarding Rule${NC}"
+    echo -e "(Showing only currently [Paused] rules)"
+    
+    found=0
+    i=1
+    printf "${YELLOW}%-4s %-10s %-10s %-16s %-s${NC}\n" "ID" "Proto" "L-Port" "Dest IP" "Remark"
+    echo "--------------------------------------------------------"
+    while IFS='|' read -r lport backend_ip backend_port proto remark status; do
+        current_status=${status:-1}
+        if [ "$current_status" == "0" ]; then
+             printf "%-4s %-10s %-10s %-16s %-s\n" "$i" "$proto" "$lport" "$backend_ip" "${remark:-"-"}"
+             found=1
+        fi
+        ((i++))
+    done < "$DB_FILE"
+
+    if [ $found -eq 0 ]; then
+        echo "No paused rules available to resume."
+        return
+    fi
+
+    read -p "Enter ID to [Resume]: " target_id
+    
+    total_lines=$(wc -l < "$DB_FILE")
+    if [[ "$target_id" =~ ^[0-9]+$ ]] && [ "$target_id" -le "$total_lines" ] && [ "$target_id" -gt 0 ]; then
+        awk -v line="$target_id" -v FS="|" -v OFS="|" 'NR==line {$6="1"} {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv "${DB_FILE}.tmp" "$DB_FILE"
+        echo -e "${GREEN}Rule ID $target_id has been resumed.${NC}"
+        apply_rules
+    else
+        echo -e "${RED}Invalid ID${NC}"
+    fi
+}
+
+# 3. Manage Rule Status (Sub-menu)
+manage_state() {
+    echo -e "\n${YELLOW}>>> Manage Rule Status${NC}"
+    echo "1. Pause Rule"
+    echo "2. Enable Rule"
+    echo "3. Return to Main Menu"
+    read -p "Select option [1-3]: " sub_choice
+    
+    case $sub_choice in
+        1) pause_rule_logic ;;
+        2) enable_rule_logic ;;
+        3) return ;;
+        *) echo "Invalid input" ;;
+    esac
+}
+
+# 4. Delete rule
 del_rule() {
     list_rules
     if [ ! -s "$DB_FILE" ]; then return; fi
     
     read -p "Enter Rule ID to delete: " del_id
-    
     # Get total lines
     total_lines=$(wc -l < "$DB_FILE")
     
@@ -169,17 +262,15 @@ del_rule() {
     fi
 }
 
-# 4. Restore/Reload Configuration (New Feature)
+# 5. Restore/Reload Configuration
 restore_config() {
     echo -e "\n${YELLOW}>>> Restoring configuration...${NC}"
-    
     # Check if database has content
     if [ ! -s "$DB_FILE" ]; then
         echo -e "${RED}Error: Database file (/etc/nat_rules.db) is empty or missing, cannot restore.${NC}"
         echo -e "Please add at least one rule first."
         return
     fi
-    
     # Force call apply_rules to rewrite and restart
     echo "Reading database and rewriting nftables config file..."
     apply_rules
@@ -188,20 +279,22 @@ restore_config() {
 # Main Menu
 enable_forwarding
 while true; do
-    echo -e "\n${CYAN}PVE Transparent Forwarding Manager - based on nftables${NC}"
-    echo "1. List Current Rules"
+    echo -e "\n${CYAN}PVE Transparent Forwarding Manager (nftables)${NC}"
+    echo "1. List All Rules"
     echo "2. Add Forwarding Rule"
-    echo "3. Delete Forwarding Rule"
-    echo "4. Restore/Reload Configuration"
-    echo "5. Exit"
-    read -p "Enter option [1-5]: " choice
+    echo "3. Pause/Enable Rules"
+    echo "4. Delete Forwarding Rule"
+    echo "5. Restore/Reload Config"
+    echo "6. Exit"
+    read -p "Enter option [1-6]: " choice
 
     case $choice in
         1) list_rules ;;
         2) add_rule ;;
-        3) del_rule ;;
-        4) restore_config ;;
-        5) exit 0 ;;
+        3) manage_state ;;
+        4) del_rule ;;
+        5) restore_config ;;
+        6) exit 0 ;;
         *) echo "Invalid input" ;;
     esac
 done
