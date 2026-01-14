@@ -1,209 +1,153 @@
-# PVE (Proxmox VE) 透明端口转发管理工具 (No-SNAT) -- 端口转发获取真实IP
-# PVE Transparent Port Forwarding Manager (No-SNAT) -- Port Forwarding to Obtain a Real IP Address
+# PVE/Debian Nftables Transparent Port Forwarding Manager
 
-> **[CN] 中文说明请向下滚动 | [EN] Scroll down for English instructions**
+# PVE/Debian Nftables 透明端口转发管理脚本
 
----
+This script provides a menu-driven interface to manage `nftables` port forwarding rules on Proxmox VE (or Debian). It is designed to be **transparent**, meaning it preserves the original client source IP address when forwarding traffic to backend VMs/Containers.
 
-## 🇨🇳 [CN] PVE 透明端口转发说明
-
-这是一个专为 **Proxmox VE (基于 Debian 12)** 设计的 Bash 自动化脚本，用于在 PVE 宿主机上快速配置和管理端口转发规则。
-
-### 🎯 解决的痛点
-
-在 PVE 环境中，我们经常需要将宿主机的公网端口转发给内部的虚拟机 (VM) 或容器 (LXC)。使用本工具解决以下问题：
-
-1.  **虚拟机无法获取真实公网 IP**
-    * **传统做法**：使用 `iptables MASQUERADE` 或常见的 NAT 脚本，虚拟机会发现所有请求都来自 PVE 网桥 IP (`vmbr0`)，导致无法进行基于 IP 的限流、审计或封禁。
-    * **本方案**：只做 DNAT（目标地址转换），**不做 SNAT**。数据包透传至虚拟机，虚拟机能看到真实的公网访客 IP。
-
-2.  **PVE 网络配置繁琐**
-    * **痛点**：手写 `nftables` 或 `iptables` 容易出错，且难以管理。
-    * **本方案**：提供菜单式操作（增/删/查），自动生成配置文件，并在 PVE 重启后自动生效。
-
-3.  **端口映射管理混乱**
-    * **痛点**：运行了十几个容器，过段时间完全忘记宿主机的 `8080` 是转给哪个容器的 Web 服务，还是转给那个 Windows VM 的 RDP？
-    * **本方案**：**内置备注功能**，你可以标记每个规则（例如：“LXC_100_Nginx”、“Win11_RDP”）。
-
-4.  **协议支持**
-    * **本方案**：支持 TCP、UDP 或 TCP+UDP 双协议一键转发（适合 DNS、游戏服务器等）。
+本脚本提供了一个基于菜单的界面，用于在 Proxmox VE (或 Debian) 上管理 `nftables` 端口转发规则。其设计核心为**透明转发**，即在将流量转发到后端虚拟机/容器时，能够**保留客户端的原始源 IP 地址**。
 
 ---
 
-### 🛠️ 核心原理与网络要求 (非常重要)
+## 🇨🇳 中文说明 (Chinese)
 
-#### 适用场景
-* **宿主机 (Host)**: 你的 PVE 服务器，拥有公网 IP。
-* **客户机 (Guest)**: PVE 内部的 VM 或 LXC 容器，通常只有内网 IP（如 `10.0.0.x` 或 `192.168.x.x`）。
+### 💡 为什么使用此脚本？(解决的痛点)
 
-#### ⚠️ 关键设置：网关指向
-由于本脚本**保留了源 IP**，虚拟机收到的数据包源地址是公网 IP。为了让虚拟机能正确回包，**必须满足以下条件：**
+1. **解决“源 IP 丢失”问题**：
+* **传统痛点**：普通的 NAT/端口转发（如 PVE 自带的防火墙或简单的 iptables SNAT）通常会将流量伪装成宿主机的 IP。这意味着后端应用（如 Nginx、Web 服务、游戏服）的日志里只能看到宿主机的内网 IP，无法获取访问者的真实 IP，导致无法进行基于 IP 的风控或统计。
+* **本脚本方案**：使用 DNAT 模式而不做 SNAT，数据包携带原始 IP 直达后端，彻底解决此问题。
 
-**虚拟机的“默认网关 (Gateway)”必须指向 PVE 宿主机的内网 IP (通常是 `vmbr0` 的 IP)。**
 
-如果虚拟机使用其他旁路由（OpenWrt）作为网关，或者网关配置错误，外部连通性将失败。
+2. **告别“管理混乱”**：
+* **传统痛点**：手动修改 `/etc/network/interfaces`、`iptables` 命令或分散的配置文件非常容易出错，时间久了很难记住开了哪些端口，甚至导致规则冲突。
+* **本脚本方案**：通过统一的数据库文件管理，提供可视化的列表视图，自动排查端口冲突，增删改查一目了然。
 
-#### 流量走向示意图
-```text
-[外部用户] (IP: 1.1.1.1)
-    |
-    v
-[PVE 宿主机] (IP: 公网 / 内网: 192.168.1.1)
-    |  <--- 脚本在此处工作 (DNAT: 目标变更为 VM IP)
-    |  <--- 保持源 IP 为 1.1.1.1
-    v
-[虚拟机/LXC] (IP: 192.168.1.100)
-    |
-    | (回包: 发送给 1.1.1.1)
-    | (关键: 必须查路由表，下一跳交给 PVE 192.168.1.1)
-    v
-[PVE 宿主机] ---> [外部用户] (连接成功)
-```
+### 📌 功能特点
 
----
+* **保留源 IP (核心功能)**：不做 SNAT (Masquerade)，后端服务可以直接获取访问者的真实 IP，而非宿主机的 IP。
+* **交互式菜单**：无需手动编辑配置文件，通过数字菜单即可完成增、删、改、查。
+* **协议支持**：支持 TCP、UDP 或 TCP+UDP 同时转发。
+* **安全白名单**：支持为每一条转发规则单独设置允许访问的源 IP（支持单 IP 或网段）。
+* **状态管理**：支持“暂停”和“开启”规则，无需删除即可临时禁用。
+* **冲突检测**：自动检测端口和协议冲突，防止配置错误。
+* **自动备份与回滚**：修改前自动备份，应用失败自动回滚，降低断网风险。
 
-### 🚀 使用指南
+### 🛠️ 环境要求
 
-#### 1. 安装脚本
+* **测试系统**：pve-manager/9.1.1/42db4a6cf33dac83 (running kernel: 6.17.2-1-pve)。
+* **权限**：必须以 `root` 用户或使用 `sudo` 运行。
+* **依赖**：`nftables` (PVE 默认已安装)。
 
-将 `pve_port_forward_cn.sh` 上传至 PVE Shell。
+### 🚀 快速开始
 
+1. **下载/创建脚本**
+将脚本内容保存为 `nat_manager.sh`。
+2. **赋予执行权限**
 ```bash
-chmod +x pve_port_forward_cn.sh
-
+chmod +x nat_manager.sh
 ```
 
-#### 2. 运行管理界面
-
+3. **运行脚本**
 ```bash
-./pve_port_forward_cn.sh
-
+./nat_manager.sh
 ```
 
-#### 3. 功能说明
 
-* **查看规则**：显示当前所有映射，包含 ID、协议、VM IP 及**备注**。
-* **添加规则**：
-* 输入 PVE 监听端口。
-* 输入 VM/LXC 的真实 IP 和端口。
-* 选择协议。
-* 输入备注（如：`CT_101_Web`）。
+### ⚠️ 关键注意事项 (必读)
 
+#### 1. 虚拟机网关设置 (至关重要！)
+由于本脚本采用**透明转发**（不执行 SNAT/伪装），数据包到达后端虚拟机时，源 IP 仍然是外部客户端的 IP（例如 `1.2.3.4`）。
 
-* **暂停/开启规则**：暂停转发但不删除记录，可以再次开启。
-* **删除规则**：根据 ID 删除。
-* **恢复/重载配置**：迁移或修改 nat_rules.db 文件后的恢复
+为了让后端虚拟机能正确将回包发送给客户端，**您必须将虚拟机的网关设置为宿主机的内部 IP**。
 
----
+##### 设置步骤：
 
-### ⚠️ PVE 特别注意事项
+1. **宿主机配置**：
+假设宿主机的 `vmbr0` (或您使用的桥接网卡) IP 地址为 `192.168.1.1`。
+2. **虚拟机/容器配置**：
+在虚拟机的网络设置中，将 **网关 (Gateway)** 设置为 `192.168.1.1` (即宿主机的 IP)。
+* *如果虚拟机网关指向了路由器的 IP（如 192.168.1.254），转发将失败，因为回包会走路由器而不是回到宿主机。*
 
-1. **防火墙兼容性**：本脚本会接管 `nftables` 的 NAT 表。如果你开启了 PVE 数据中心级别的防火墙功能，请测试兼容性。通常情况下，NAT 规则与 PVE 的 Filter 规则是共存的。
-2. **SSH 防断连**：请勿在脚本中随意修改 `INPUT` 链规则（脚本默认允许 INPUT），以免丢失对 PVE 8006 面板或 SSH 的访问。
+#### 2. 防火墙与端口封禁 (特别提示)
 
----
-
-## 🇺🇸 [EN] PVE Transparent Port Forwarding Manager
-
-This is a Bash automation script designed specifically for **Proxmox VE (Debian 12 based)**. It allows you to quickly configure and manage port forwarding rules on the PVE Host.
-
-### 🎯 The Pain Points Solved
-
-In a PVE environment, forwarding public ports from the Host to internal VMs or LXC containers often comes with challenges:
-
-1. **Loss of Client Real IP**
-* **Standard Method**: Using `iptables MASQUERADE` creates a SNAT, making all traffic reaching the VM look like it comes from the PVE Host's internal IP (`vmbr0`). This breaks IP-based logging, rate-limiting, or banning.
-* **This Solution**: Uses **DNAT only (No SNAT)**. Packets are transparently forwarded to the VM, preserving the original client public IP.
+* **绕过宿主机 Input 防火墙**：本脚本配置的端口转发发生在网络层的 `Prerouting` 阶段，优先于宿主机的 `Input` 链。
+* **这意味着**：即使您在宿主机的防火墙（如 UFW 或 PVE 数据中心防火墙的 Input 规则）中封禁了某个端口（例如 8080），只要通过本脚本配置了 8080 的转发，**流量依然会被转发到后端**，因为流量根本没有进入宿主机的“本地输入”流程。
+* **安全建议**：如果您需要限制访问，请直接在脚本添加规则时使用 **“源 IP 白名单”** 功能。
 
 
-2. **Complex Configuration**
-* **Problem**: Managing raw `nftables` or iptables rules manually is error-prone.
-* **This Solution**: Provides a simple Menu-Driven Interface (Add/List/Delete), generates config files automatically, and persists across reboots.
+### 📂 文件说明
 
-
-3. **Management Chaos**
-* **Problem**: Forgetting which host port maps to which VM service (Web? RDP? SSH?) after a few weeks.
-* **This Solution**: **Built-in Remarks/Comments**. You can label every rule (e.g., "LXC_100_Nginx", "Win11_RDP").
-
-
-4. **Protocol Support**
-* **This Solution**: One-click support for TCP, UDP, or TCP+UDP (Dual Stack).
-
-
+* `/etc/nat_rules.db`: 规则数据库文件（文本格式，可备份）。
+* `/etc/nftables.conf`: 脚本生成的实际 nftables 配置文件（**注意：手动修改此文件会被脚本覆盖**）。
 
 ---
 
-### 🛠️ Core Principle & Requirements (Crucial)
+## 🇺🇸 English Instructions
 
-#### Scenario
+### 💡 Why use this script? (Pain Points Solved)
 
-* **Host**: Your PVE Server (with Public IP).
-* **Guest**: VM or LXC Container inside PVE (Private IP, e.g., `192.168.x.x`).
+1. **Solves the "Lost Source IP" Issue**:
+* **The Problem**: Standard NAT/Port Forwarding (like default PVE firewall or simple iptables SNAT) usually masks the traffic as coming from the Host's internal IP. Backend applications (Nginx, Game Servers, etc.) cannot see the real client IP, making IP-based logging, banning, or analytics impossible.
+* **The Solution**: This script uses DNAT without SNAT. Packets arrive at the backend carrying the original client IP.
 
-#### ⚠️ Critical Setup: Gateway
 
-Since this script **preserves the Source IP**, the VM receives packets directly from the Public IP. For the return traffic to find its way back:
+2. **Eliminates Management Chaos**:
+* **The Problem**: Manually editing network interfaces, raw iptables commands, or scattered config files is error-prone. It's easy to forget which ports are open or cause rule conflicts.
+* **The Solution**: Uses a unified database file with a visual list view. It automatically detects port conflicts and makes management (Add/Delete/Pause) simple and organized.
 
-**The VM/LXC's "Default Gateway" MUST point to the PVE Host's Internal IP (usually the `vmbr0` IP).**
+### 📌 Features
 
-If your VM uses another router (like an internal OpenWrt VM) as its gateway, connectivity will fail.
+* **Preserve Source IP (Core)**: Does not perform SNAT (Masquerade). Backend services see the real client IP, not the host's IP.
+* **Interactive Menu**: Manage rules (Add, List, Pause, Delete) via a CLI menu without editing config files manually.
+* **Protocol Support**: Supports TCP, UDP, or both simultaneously.
+* **Access Whitelist**: Define allowed source IPs (single IP or CIDR subnet) for each forwarding rule.
+* **State Management**: Pause and enable rules without deleting them.
+* **Conflict Detection**: Prevents port and protocol conflicts automatically.
+* **Auto Backup & Rollback**: Backs up configuration before changes and rolls back automatically if application fails.
 
-#### Traffic Flow Diagram
+### 🛠️ Prerequisites
 
-```text
-[Public User] (IP: 1.1.1.1)
-    |
-    v
-[PVE Host] (IP: Public / Internal: 192.168.1.1)
-    |  <--- Script Logic (DNAT: Change Dest to VM IP)
-    |  <--- Keeps Source IP as 1.1.1.1
-    v
-[Guest VM/LXC] (IP: 192.168.1.100)
-    |
-    | (Reply: Send to 1.1.1.1)
-    | (CRITICAL: Routing table sends packet to Gateway 192.168.1.1)
-    v
-[PVE Host] ---> [Public User] (Connection Established)
-
-```
-
----
+* **Testing System**: pve-manager/9.1.1/42db4a6cf33dac83 (running kernel: 6.17.2-1-pve).
+* **Privileges**: Must be run as `root` or via `sudo`.
+* **Dependency**: `nftables` (Default on PVE).
 
 ### 🚀 Quick Start
 
-#### 1. Install
-
-Upload `pve_port_forward_en.sh` to your PVE Shell.
-
+1. **Download/Create Script**
+Save the script content as `nat_manager.sh`.
+2. **Make Executable**
 ```bash
-chmod +x pve_port_forward_en.sh
-
+chmod +x nat_manager.sh
 ```
 
-#### 2. Run
-
+3. **Run Script**
 ```bash
-./pve_port_forward_en.sh
-
+./nat_manager.sh
 ```
 
-#### 3. Features
 
-* **List Rules**: Show all active mappings with IDs, Protocols, VM IPs, and **Remarks**.
-* **Add Rule**:
-* Input Host listening port.
-* Input Guest VM IP and port.
-* Select Protocol (TCP / UDP / Both).
-* Input Remark (e.g., `CT_101_Web`).
+### ⚠️ Important Notes (Must Read)
+
+#### 1. VM Gateway Configuration (Critical!)
+Because this script uses **Transparent Forwarding** (No SNAT/Masquerade), packets arrive at the backend VM with the original external client IP (e.g., `1.2.3.4`).
+
+For the backend VM to send the return traffic back to the client correctly, **you must set the VM's Default Gateway to the Host's IP address.**
+
+##### Configuration Steps:
+
+1. **Host Configuration**:
+Assume your Host's bridge interface (e.g., `vmbr0`) IP is `192.168.1.1`.
+2. **VM/Container Configuration**:
+In the network settings of your VM or Container, set the **Gateway** to `192.168.1.1` (The Host's IP).
+* *If the VM's gateway is set to your physical router (e.g., 192.168.1.254), forwarding will fail because return packets will bypass the host.*
+
+#### 2. Firewall Behavior (Tip)
+
+* **Bypasses Host Input Firewall**: The port forwarding configured by this script happens at the `Prerouting` stage, which occurs *before* the Host's `Input` chain.
+* **Implication**: Even if you block a port (e.g., 8080) on the Host's local firewall (like UFW or PVE Input rules), traffic will **still be forwarded** if a rule exists in this script. The traffic is redirected before the Host's local firewall can drop it.
+* **Security Advice**: To restrict access, please use the **"Source IP Whitelist"** feature provided within the script when adding a rule.
 
 
-* **Pause/Enable Rules**：Pausing forwarding without deleting records allows you to resume it later.
-* **Delete Rule**: Remove rules by ID.
-* **Restore/Reload Configuration**：Restoration after migrating or modifying the nat_rules.db file.
+### 📂 File Structure
 
----
-
-### ⚠️ PVE Specific Notes
-
-1. **Firewall Compatibility**: This script manages the `nftables` NAT table. If you rely heavily on the PVE GUI Firewall (Data Center level), please test for compatibility. Generally, NAT rules coexist peacefully with PVE Filter rules.
-2. **Safety**: The script allows all INPUT traffic by default to prevent locking you out of the PVE Web GUI (8006) or SSH.
+* `/etc/nat_rules.db`: The rules database (Text format, easy to backup).
+* `/etc/nftables.conf`: The actual configuration file generated by the script (**Note: Manual edits to this file will be overwritten by the script**).
