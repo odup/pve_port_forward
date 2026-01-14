@@ -12,7 +12,7 @@ This script provides a menu-driven interface to manage `nftables` port forwardin
 
 ### 💡 为什么使用此脚本？(解决的痛点)
 
-1. **解决“源 IP 丢失”问题**：
+1. **解决“源 IP 丢失”问题(端口转发获取 源IP/真实IP)**：
 * **传统痛点**：普通的 NAT/端口转发（如 PVE 自带的防火墙或简单的 iptables SNAT）通常会将流量伪装成宿主机的 IP。这意味着后端应用（如 Nginx、Web 服务、游戏服）的日志里只能看到宿主机的内网 IP，无法获取访问者的真实 IP，导致无法进行基于 IP 的风控或统计。
 * **本脚本方案**：使用 DNAT 模式而不做 SNAT，数据包携带原始 IP 直达后端，彻底解决此问题。
 
@@ -29,7 +29,7 @@ This script provides a menu-driven interface to manage `nftables` port forwardin
 * **安全白名单**：支持为每一条转发规则单独设置允许访问的源 IP（支持单 IP 或网段）。
 * **状态管理**：支持“暂停”和“开启”规则，无需删除即可临时禁用。
 * **冲突检测**：自动检测端口和协议冲突，防止配置错误。
-* **自动备份与回滚**：修改前自动备份，应用失败自动回滚，降低断网风险。
+* **自动备份与回滚**：添加规则前自动备份，应用失败自动回滚，降低断网风险。
 
 ### 🛠️ 环境要求
 
@@ -85,7 +85,7 @@ chmod +x nat_manager.sh
 
 ### 💡 Why use this script? (Pain Points Solved)
 
-1. **Solves the "Lost Source IP" Issue**:
+1. **Solves the "Lost Source IP" Issue(Port Forwarding to Obtain Source IP/Real IP)**:
 * **The Problem**: Standard NAT/Port Forwarding (like default PVE firewall or simple iptables SNAT) usually masks the traffic as coming from the Host's internal IP. Backend applications (Nginx, Game Servers, etc.) cannot see the real client IP, making IP-based logging, banning, or analytics impossible.
 * **The Solution**: This script uses DNAT without SNAT. Packets arrive at the backend carrying the original client IP.
 
@@ -102,7 +102,7 @@ chmod +x nat_manager.sh
 * **Access Whitelist**: Define allowed source IPs (single IP or CIDR subnet) for each forwarding rule.
 * **State Management**: Pause and enable rules without deleting them.
 * **Conflict Detection**: Prevents port and protocol conflicts automatically.
-* **Auto Backup & Rollback**: Backs up configuration before changes and rolls back automatically if application fails.
+* **Auto Backup & Rollback**: Backs up configuration before adding rules and rolls back automatically if application fails.
 
 ### 🛠️ Prerequisites
 
