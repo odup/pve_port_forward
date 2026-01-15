@@ -9,15 +9,15 @@ DB_FILE="/etc/nat_rules.db"
 NFT_CONF="/etc/nftables.conf"
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+RED='\033[1;31m'
+GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
+CYAN='\033[1;36m'
 NC='\033[0m'
 
 # 检查 Root 权限
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}请使用 sudo 运行此脚本！${NC}"
+  echo -e "${RED}请使用 root权限 运行此脚本！${NC}"
   exit 1
 fi
 
@@ -26,12 +26,19 @@ if [ ! -f "$DB_FILE" ]; then
     touch "$DB_FILE"
 fi
 
-# 确保开启内核转发
-enable_forwarding() {
+# 确保开启内核转发和Nftables开机自启动
+setup_forwarding_env() {
     # 如果文件不存在(-f) 或者(||) 文件中没有这行配置，则写入
     if [ ! -f /etc/sysctl.conf ] || ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+        echo "检测到未开启 内核转发，正在写入配置..."
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf > /dev/null
+    fi
+    
+    # 检测 nftables 开机自启
+    if ! systemctl is-enabled --quiet nftables; then
+        echo "检测到 nftables 未开机自启，正在启用..."
+        systemctl enable nftables > /dev/null 2>&1
     fi
 }
 
@@ -106,7 +113,7 @@ table ip filter {
         # 默认策略改为 drop (拒绝所有转发)
         type filter hook forward priority 0; policy drop; 
         
-        # 允许已建立连接的回包（关键！）如果不加这句，回包会被拦截，转发也会断
+        # 允许已建立连接的回包（关键！），如果不加这句，回包会被拦截，转发也会断。
         ct state established,related accept
         
 EOF
@@ -138,7 +145,7 @@ EOF
                         # 包含逗号，视为 IP 列表，加上花括号
                         limit_str="ip saddr { $safe_whitelist } "
                     else
-                        # 不包含逗号，视为单个 IP，不加花括号
+                        # 不包含逗号，视为单个 IP 或 网段，不加花括号
                         limit_str="ip saddr $safe_whitelist "
                     fi
                 fi
@@ -163,10 +170,15 @@ EOF
 }
 EOF
 
-    # 重启 nftables 应用配置
-    systemctl enable nftables > /dev/null 2>&1
-    systemctl restart nftables
-	
+    # 根据Nftables服务状态选择不同命令
+    if systemctl is-active --quiet nftables; then
+        # 启动状态重载配置
+        systemctl reload nftables
+    else
+        # 停止状态重启服务
+        systemctl restart nftables
+    fi
+    
     local error_status=$?
     
     if [ $error_status -eq 0 ]; then
@@ -299,14 +311,14 @@ add_rule() {
         echo -e "${YELLOW}提示：待添加的 端口+协议 与已存在的转发规则冲突，请勿重复添加。${NC}"
         return
     fi
-	
-	# 备份原来配置
-	cp "$DB_FILE" "${DB_FILE}.bak"
-	
+    
+    # 备份原来配置
+    cp "$DB_FILE" "${DB_FILE}.bak"
+    
     echo "$lport|$backend_ip|$backend_port|$proto|$user_remark|1|$whitelist_input" >> "$DB_FILE"
     apply_rules
-	
-	# 异常处理机制
+    
+    # 异常处理机制
     if [ $? -ne 0 ]; then
         echo -e "${YELLOW}>>> 检测到配置错误，正在自动回滚...${NC}"
         mv "${DB_FILE}.bak" "$DB_FILE" # 恢复备份
@@ -411,7 +423,7 @@ restore_config() {
 }
 
 # 主菜单
-enable_forwarding
+setup_forwarding_env
 while true; do
     echo -e "\n${CYAN}PVE 透明转发管理 (nftables)${NC}"
     if systemctl is-active --quiet nftables; then
@@ -419,7 +431,7 @@ while true; do
     else
         nft_status="${RED}● 已停止${NC}"
     fi
-	echo -e "服务监控: ${nft_status}${NC}"
+    echo -e "服务监控: ${nft_status}${NC}"
     echo "1. 查看所有规则"
     echo "2. 添加转发规则"
     echo "3. 暂停/开启规则"
