@@ -86,10 +86,10 @@ EOF
                 fi
 
                 if [ "$proto" == "tcp+udp" ]; then
-                    echo "        ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                    echo "        ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 else
-                    echo "        ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 fi
                 echo "" >> "$NFT_CONF"
             fi
@@ -102,7 +102,8 @@ EOF
 
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # No Masquerade, preserve source IP
+        
+        oifname "vmbr0" masquerade
     }
 }
 
@@ -113,9 +114,12 @@ table ip filter {
         # Default policy changed to drop (Deny all forwarding)
         type filter hook forward priority 0; policy drop; 
         
+        tcp flags syn tcp option maxseg size set rt mtu
+        
         # Allow established connection packets (Critical!), Without this, return packets are blocked and forwarding breaks.
         ct state established,related accept
         
+        iifname "vmbr1" accept
 EOF
 
     # ---------------------------------------------------------

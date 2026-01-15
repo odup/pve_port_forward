@@ -86,10 +86,10 @@ EOF
                 fi
 
                 if [ "$proto" == "tcp+udp" ]; then
-                    echo "        ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                    echo "        ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 else
-                    echo "        ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        iifname \"vmbr0\" ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 fi
                 echo "" >> "$NFT_CONF"
             fi
@@ -102,7 +102,10 @@ EOF
 
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # 不做 Masquerade，保留源 IP
+        
+        # 【关键：只对出公网的流量做伪装】
+        # 只有当数据包从 vmbr0 (公网口) 出去时，才把源 IP 改为宿主机 IP (Masquerade)。
+        oifname "vmbr0" masquerade
     }
 }
 
@@ -113,8 +116,14 @@ table ip filter {
         # 默认策略改为 drop (拒绝所有转发)
         type filter hook forward priority 0; policy drop; 
         
+        # 自动调整 MSS，修复 400 错误和网页卡顿
+        tcp flags syn tcp option maxseg size set rt mtu
+        
         # 允许已建立连接的回包（关键！），如果不加这句，回包会被拦截，转发也会断。
         ct state established,related accept
+        
+        # 【必须】允许内网流量 (上网 & 互通)
+        iifname "vmbr1" accept
         
 EOF
 
