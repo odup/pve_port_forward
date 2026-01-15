@@ -8,6 +8,14 @@ This script provides a menu-driven interface to manage `nftables` port forwardin
 
 ---
 
+**中文脚本截图：**
+![img_cn.png](img_cn.png)
+
+**English Script Screenshot:**
+![img_en.png](img_en.png)
+
+---
+
 ## 🇨🇳 中文说明 (Chinese)
 
 ### 💡 为什么使用此脚本？(解决的痛点)
