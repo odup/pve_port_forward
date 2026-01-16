@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# ================= 配置区 =================
+# 公网桥名称 (一般是 PVE 的管理口)
+WAN_IF="vmbr0"
+# =========================================
+
 # 强制设置语言环境为 UTF-8
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -26,6 +31,54 @@ if [ ! -f "$DB_FILE" ]; then
     touch "$DB_FILE"
 fi
 
+# 定义获取私有子网的函数，排除公网桥，一般是vmbr0。
+get_private_vmbr_subnets() {
+    # 使用 ip route 获取路由表
+    # scope link: 仅显示直连路由（即子网）
+    # proto kernel: 仅显示由内核自动生成的路由（配置IP后自动产生）
+    ip -o -4 route show scope link proto kernel | awk '
+    function is_private(ip) {
+        return (ip ~ /^10\./) || \
+               (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) || \
+               (ip ~ /^192\.168\./)
+    }
+
+    {
+        iface = ""
+        for(i=1; i<=NF; i++) {
+            if($i == "dev") {
+                iface = $(i+1)
+                break
+            }
+        }
+
+        # 逻辑：接口名以 vmbr 开头 且 不等于 vmbr0
+        if (iface ~ /^vmbr/ && iface != "vmbr0") {
+            # $1 在 route 输出中直接就是 CIDR 网络地址
+            split($1, a, "/")
+            ip = a[1]
+            if (is_private(ip)) {
+                print $1
+            }
+        }
+    }'
+}
+
+# 获取所有符合条件的子网
+SUBNETS=$(get_private_vmbr_subnets)
+
+# 检查是否找到了子网
+if [ -z "$SUBNETS" ]; then
+    echo -e "${RED}没有检测到 vmbr* 设置的私有子网，脚本停止，无法配置面向NAT虚拟机的端口转发。${NC}"
+    echo -e "${RED}常见私有网段：10.0.0.0/8； 172.16.0.0/12； 192.168.0.0/16；${NC}"
+    exit 0
+else
+    echo -e "${CYAN}检测到以下私有子网：${NC}"
+    for cidr in $SUBNETS; do
+        echo "$cidr"
+    done
+fi
+
 # 确保开启内核转发和Nftables开机自启动
 setup_forwarding_env() {
     # 如果文件不存在(-f) 或者(||) 文件中没有这行配置，则写入
@@ -42,9 +95,8 @@ setup_forwarding_env() {
     fi
 }
 
-# 核心函数：根据数据库生成 nftables 配置并应用
+# 核心函数：根据数据库生成 nftables 配置并应用，这将覆盖原有的 nftables.conf
 apply_rules() {
-    # 开始生成配置文件（这将覆盖原有的 nftables.conf）
     cat > "$NFT_CONF" <<EOF
 #!/usr/sbin/nft -f
 
@@ -56,9 +108,7 @@ table ip nat {
         
 EOF
 
-    # ---------------------------------------------------------
-    # 第一遍循环：生成 NAT (DNAT) 规则
-    # ---------------------------------------------------------
+    # 生成 NAT (DNAT) 规则
     while IFS='|' read -r lport backend_ip backend_port proto remark status whitelist; do
         if [[ -n "$lport" ]]; then
             # status: 1=启用, 0=暂停 (如果为空默认为1)
@@ -84,19 +134,20 @@ EOF
                         limit_str="ip saddr $safe_whitelist "
                     fi
                 fi
-
+                
+                # 去查询路由表（FIB），看看数据包的目标IP（daddr），是不是属于宿主机（PVE）自己的IP？
+                # 只要目标IP是本机IP，就会被以下 DNAT 规则匹配和转发。
                 if [ "$proto" == "tcp+udp" ]; then
-                    echo "        iifname \"vmbr0\" ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                    echo "        iifname \"vmbr0\" ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        fib daddr type local ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        fib daddr type local ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 else
-                    echo "        iifname \"vmbr0\" ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
+                    echo "        fib daddr type local ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
                 fi
                 echo "" >> "$NFT_CONF"
             fi
         fi
     done < "$DB_FILE"
 
-    # 关闭 nat 表，开始 filter 表
     cat >> "$NFT_CONF" <<EOF
     }
 
@@ -104,8 +155,15 @@ EOF
         type nat hook postrouting priority srcnat; policy accept;
         
         # 【关键：只对出公网的流量做伪装】
-        # 只有当数据包从 vmbr0 (公网口) 出去时，才把源 IP 改为宿主机 IP (Masquerade)。
-        oifname "vmbr0" masquerade
+        # 根据获取到的私有子网列表，设置只有当数据包从公网接口出去时，才把源IP改为宿主机IP的规则。
+EOF
+
+    # 私有子网访问互联网的流量做伪装。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr oifname \"$WAN_IF\" masquerade" >> "$NFT_CONF"
+    done
+
+    cat >> "$NFT_CONF" <<EOF
     }
 }
 
@@ -114,23 +172,28 @@ table ip filter {
     
     chain forward { 
         # 默认策略改为 drop (拒绝所有转发)
-        type filter hook forward priority 0; policy drop; 
-        
-        # 自动调整 MSS，修复 400 错误和网页卡顿
-        tcp flags syn tcp option maxseg size set rt mtu
+        type filter hook forward priority 0; policy drop;
         
         # 允许已建立连接的回包（关键！），如果不加这句，回包会被拦截，转发也会断。
         ct state established,related accept
         
-        # 【必须】允许内网流量 (上网 & 互通)
-        iifname "vmbr1" accept
-        
+        # 根据获取到的私有子网列表，设置内网互相访问和内网访问公网的规则。
 EOF
 
-    # ---------------------------------------------------------
-    # 第二遍循环：生成 Filter (Forward) 白名单规则
+    # 私有子网互相访问设置，如需禁止访问请删除。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr ip daddr $cidr ct state new accept" >> "$NFT_CONF"
+    done
+    echo "" >> "$NFT_CONF"
+
+    # 私有子网访问公网设置(无状态限制，适合网络测试)。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr oifname \"$WAN_IF\" accept" >> "$NFT_CONF"
+    done
+    echo "" >> "$NFT_CONF"
+
+    # 生成 Filter (Forward) 白名单规则
     # 注意：Forward 链匹配的是 DNAT 之后的目标 IP (后端IP) 和 端口
-    # ---------------------------------------------------------
     while IFS='|' read -r lport backend_ip backend_port proto remark status whitelist; do
         if [[ -n "$lport" ]]; then
             # status: 1=启用, 0=暂停 (如果为空默认为1)
@@ -160,19 +223,18 @@ EOF
                 fi
 
                 # 写入 Forward 规则
-                # 语法: [源IP限制] ip daddr <后端IP> <协议> dport <后端端口> accept
+                # 语法: [源IP限制] ip daddr <后端IP> <协议> dport <后端端口> ct state new accept
                 if [ "$proto" == "tcp+udp" ]; then
-                    echo "        ${limit_str}ip daddr $backend_ip tcp dport $backend_port accept" >> "$NFT_CONF"
-                    echo "        ${limit_str}ip daddr $backend_ip udp dport $backend_port accept" >> "$NFT_CONF"
+                    echo "        ${limit_str}ip daddr $backend_ip tcp dport $backend_port ct state new accept" >> "$NFT_CONF"
+                    echo "        ${limit_str}ip daddr $backend_ip udp dport $backend_port ct state new accept" >> "$NFT_CONF"
                 else
-                    echo "        ${limit_str}ip daddr $backend_ip $proto dport $backend_port accept" >> "$NFT_CONF"
+                    echo "        ${limit_str}ip daddr $backend_ip $proto dport $backend_port ct state new accept" >> "$NFT_CONF"
                 fi
                 echo "" >> "$NFT_CONF"
             fi
         fi
     done < "$DB_FILE"
 
-    # 收尾
     cat >> "$NFT_CONF" <<EOF
     }
     chain output { type filter hook output priority 0; policy accept; }
