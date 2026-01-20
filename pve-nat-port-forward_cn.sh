@@ -1,16 +1,15 @@
 #!/bin/bash
 
 # ================= 配置区 =================
-# 公网桥名称 (一般是 PVE 的管理口)
+# 公网IP网桥名称
 WAN_IF="vmbr0"
-# =========================================
 
 # 强制设置语言环境为 UTF-8
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
 # 配置文件路径
-DB_FILE="/etc/nat_rules.db"
+DB_FILE="/etc/port_forward_rules.db"
 NFT_CONF="/etc/nftables.conf"
 
 # 颜色定义
@@ -19,22 +18,12 @@ GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[1;36m'
 NC='\033[0m'
+# =========================================
 
-# 检查 Root 权限
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}请使用 root权限 运行此脚本！${NC}"
-  exit 1
-fi
-
-# 初始化数据库文件
-if [ ! -f "$DB_FILE" ]; then
-    touch "$DB_FILE"
-fi
-
-# 定义获取私有子网的函数，排除公网桥，一般是vmbr0。
+# 获取网桥的私有网段，排除公网IP网桥(一般是vmbr0)。
 get_private_vmbr_subnets() {
     # 使用 ip route 获取路由表
-    # scope link: 仅显示直连路由（即子网）
+    # scope link: 仅显示直连路由
     # proto kernel: 仅显示由内核自动生成的路由（配置IP后自动产生）
     ip -o -4 route show scope link proto kernel | awk '
     function is_private(ip) {
@@ -64,207 +53,91 @@ get_private_vmbr_subnets() {
     }'
 }
 
-# 获取所有符合条件的子网
+# 获取所有符合条件的私有网段
 SUBNETS=$(get_private_vmbr_subnets)
 
-# 检查是否找到了子网
+# 检查是否找到了私有网段
 if [ -z "$SUBNETS" ]; then
-    echo -e "${RED}没有检测到 vmbr* 设置的私有子网，脚本停止，无法配置面向NAT虚拟机的端口转发。${NC}"
-    echo -e "${RED}常见私有网段：10.0.0.0/8； 172.16.0.0/12； 192.168.0.0/16；${NC}"
+    echo -e "${RED}没有检测到 vmbr* 设置的私有网段，脚本停止，无法配置面向 NAT虚拟机 的端口转发。${NC}"
+    echo -e "${RED}RFC 1918 标准定义的 私有网络地址：10.0.0.0/8； 172.16.0.0/12； 192.168.0.0/16；${NC}"
     exit 0
 else
-    echo -e "${CYAN}检测到以下私有子网：${NC}"
+    echo -e "${CYAN}> 检测到以下私有网段：${NC}"
     for cidr in $SUBNETS; do
         echo "$cidr"
     done
 fi
 
-# 确保开启内核转发和Nftables开机自启动
+# 检查 Root 权限
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}请使用 root权限 运行此脚本！${NC}"
+  exit 1
+fi
+
+# 初始化数据库文件
+if [ ! -f "$DB_FILE" ]; then
+    touch "$DB_FILE"
+fi
+
+# 提醒当前PVE系统使用的SSH端口和管理界面端口
+get_system_ports() {
+    # --- 1. 获取 SSH 端口 ---
+    # 策略1:使用 ss 命令检测 sshd 进程实际监听的端口
+    local ssh_detected
+    ssh_detected=$(ss -tlnp | grep -w "sshd" | head -n 1 | awk '{print $4}' | awk -F':' '{print $NF}')
+    
+    if [ -z "$ssh_detected" ]; then
+        DETECTED_SSH_PORT=''
+    else
+        DETECTED_SSH_PORT=$ssh_detected
+    fi
+    
+    # 策略2: 如果没检测到运行中的进程，则分析配置文件
+    if [ -z "$DETECTED_SSH_PORT" ]; then
+        # 查找没有注释的 Port 行
+        CONFIG_PORT=$(grep "^Port " /etc/ssh/sshd_config | awk '{print $2}' | head -n 1)
+        
+        if [ -n "$CONFIG_PORT" ]; then
+            DETECTED_SSH_PORT=$CONFIG_PORT
+        else
+            # 策略3: 配置文件全是注释 (#Port 22)，则默认为 22
+            DETECTED_SSH_PORT=22
+        fi
+    fi
+
+    # --- 2. 获取 PVE Web 端口 ---
+    # 使用 ss 命令检测 pveproxy 进程
+    local pve_detected
+    pve_detected=$(ss -tlnp | grep "pveproxy" | head -n 1 | awk '{print $4}' | awk -F':' '{print $NF}')
+
+    if [ -z "$pve_detected" ]; then
+        DETECTED_PVE_PORT=8006
+    else
+        DETECTED_PVE_PORT=$pve_detected
+    fi
+    
+    echo -e "> 宿主机当前SSH端口：${GREEN}${DETECTED_SSH_PORT}${NC} 管理界面端口：${GREEN}${DETECTED_PVE_PORT}${NC}，请勿添加这两个端口的转发。"
+}
+get_system_ports
+
+# 确保开启内核转发和nftables开机自启动
 setup_forwarding_env() {
     # 如果文件不存在(-f) 或者(||) 文件中没有这行配置，则写入
     if [ ! -f /etc/sysctl.conf ] || ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "检测到未开启 内核转发，正在写入配置..."
+        echo -e "${YELLOW}检测到未开启 内核转发，正在写入配置...${NC}"
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p /etc/sysctl.conf > /dev/null
     fi
     
     # 检测 nftables 开机自启
     if ! systemctl is-enabled --quiet nftables; then
-        echo "检测到 nftables 未开机自启，正在启用..."
+        echo -e "${YELLOW}检测到 nftables 未开机自启，正在启用...${NC}"
         systemctl enable nftables > /dev/null 2>&1
     fi
 }
+setup_forwarding_env
 
-# 核心函数：根据数据库生成 nftables 配置并应用，这将覆盖原有的 nftables.conf
-apply_rules() {
-    cat > "$NFT_CONF" <<EOF
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-table ip nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        
-EOF
-
-    # 生成 NAT (DNAT) 规则
-    while IFS='|' read -r lport backend_ip backend_port proto remark status whitelist; do
-        if [[ -n "$lport" ]]; then
-            # status: 1=启用, 0=暂停 (如果为空默认为1)
-            current_status=${status:-1}
-            remark_text=${remark:-无}
-            current_whitelist=${whitelist// /}
-            # 只有当状态为 1 时才写入配置
-            if [ "$current_status" == "1" ]; then
-                # 在配置文件中添加注释，方便调试
-                echo "        # 备注: $remark_text" >> "$NFT_CONF"
-
-                limit_str=""
-                if [[ -n "$current_whitelist" ]]; then
-                    # 替换中文逗号为英文逗号
-                    safe_whitelist=${current_whitelist//，/,}
-
-                    # 判断字符串中是否包含逗号
-                    if [[ "$safe_whitelist" == *","* ]]; then
-                        # 包含逗号，视为 IP 列表，加上花括号
-                        limit_str="ip saddr { $safe_whitelist } "
-                    else
-                        # 不包含逗号，视为单个 IP，不加花括号
-                        limit_str="ip saddr $safe_whitelist "
-                    fi
-                fi
-                
-                # 去查询路由表（FIB），看看数据包的目标IP（daddr），是不是属于宿主机（PVE）自己的IP？
-                # 只要目标IP是本机IP，就会被以下 DNAT 规则匹配和转发。
-                if [ "$proto" == "tcp+udp" ]; then
-                    echo "        fib daddr type local ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                    echo "        fib daddr type local ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                else
-                    echo "        fib daddr type local ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port" >> "$NFT_CONF"
-                fi
-                echo "" >> "$NFT_CONF"
-            fi
-        fi
-    done < "$DB_FILE"
-
-    cat >> "$NFT_CONF" <<EOF
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        
-        # 【关键：只对出公网的流量做伪装】
-        # 根据获取到的私有子网列表，设置只有当数据包从公网接口出去时，才把源IP改为宿主机IP的规则。
-EOF
-
-    # 私有子网访问互联网的流量做伪装。
-    for cidr in $SUBNETS; do
-        echo "        ip saddr $cidr oifname \"$WAN_IF\" masquerade" >> "$NFT_CONF"
-    done
-
-    cat >> "$NFT_CONF" <<EOF
-    }
-}
-
-table ip filter {
-    chain input { type filter hook input priority 0; policy accept; }
-    
-    chain forward { 
-        # 默认策略改为 drop (拒绝所有转发)
-        type filter hook forward priority 0; policy drop;
-        
-        # 允许已建立连接的回包（关键！），如果不加这句，回包会被拦截，转发也会断。
-        ct state established,related accept
-        
-        # 根据获取到的私有子网列表，设置内网互相访问和内网访问公网的规则。
-EOF
-
-    # 私有子网互相访问设置，如需禁止访问请删除。
-    for cidr in $SUBNETS; do
-        echo "        ip saddr $cidr ip daddr $cidr ct state new accept" >> "$NFT_CONF"
-    done
-    echo "" >> "$NFT_CONF"
-
-    # 私有子网访问公网设置(无状态限制，适合网络测试)。
-    for cidr in $SUBNETS; do
-        echo "        ip saddr $cidr oifname \"$WAN_IF\" accept" >> "$NFT_CONF"
-    done
-    echo "" >> "$NFT_CONF"
-
-    # 生成 Filter (Forward) 白名单规则
-    # 注意：Forward 链匹配的是 DNAT 之后的目标 IP (后端IP) 和 端口
-    while IFS='|' read -r lport backend_ip backend_port proto remark status whitelist; do
-        if [[ -n "$lport" ]]; then
-            # status: 1=启用, 0=暂停 (如果为空默认为1)
-            current_status=${status:-1}
-            remark_text=${remark:-无}
-            current_whitelist=${whitelist// /}
-            # 只有当状态为 1 时才写入配置
-            if [ "$current_status" == "1" ]; then
-                # 在配置文件中添加注释，方便调试
-                echo "        # 备注: $remark_text" >> "$NFT_CONF"
-                
-                # 处理白名单 (用于 Forward)
-                # 如果 NAT 层限制了源IP，Forward 层最好也加上同样的限制，实现双重保险
-                limit_str=""
-                if [[ -n "$current_whitelist" ]]; then
-                    # 替换中文逗号为英文逗号
-                    safe_whitelist=${current_whitelist//，/,}
-
-                    # 判断字符串中是否包含逗号
-                    if [[ "$safe_whitelist" == *","* ]]; then
-                        # 包含逗号，视为 IP 列表，加上花括号
-                        limit_str="ip saddr { $safe_whitelist } "
-                    else
-                        # 不包含逗号，视为单个 IP 或 网段，不加花括号
-                        limit_str="ip saddr $safe_whitelist "
-                    fi
-                fi
-
-                # 写入 Forward 规则
-                # 语法: [源IP限制] ip daddr <后端IP> <协议> dport <后端端口> ct state new accept
-                if [ "$proto" == "tcp+udp" ]; then
-                    echo "        ${limit_str}ip daddr $backend_ip tcp dport $backend_port ct state new accept" >> "$NFT_CONF"
-                    echo "        ${limit_str}ip daddr $backend_ip udp dport $backend_port ct state new accept" >> "$NFT_CONF"
-                else
-                    echo "        ${limit_str}ip daddr $backend_ip $proto dport $backend_port ct state new accept" >> "$NFT_CONF"
-                fi
-                echo "" >> "$NFT_CONF"
-            fi
-        fi
-    done < "$DB_FILE"
-
-    cat >> "$NFT_CONF" <<EOF
-    }
-    chain output { type filter hook output priority 0; policy accept; }
-}
-EOF
-
-    # 根据Nftables服务状态选择不同命令
-    if systemctl is-active --quiet nftables; then
-        # 启动状态重载配置
-        systemctl reload nftables
-    else
-        # 停止状态重启服务
-        systemctl restart nftables
-    fi
-    
-    local error_status=$?
-    
-    if [ $error_status -eq 0 ]; then
-        echo -e "${GREEN}配置已更新并生效！${NC}"
-        return 0
-    else
-        echo -e "${RED}应用配置失败，请检查输入是否合法。${NC}"
-        # 输出错误日志最后几行帮助排查
-        echo -e "${YELLOW}错误详情 (journalctl):${NC}"
-        journalctl -xeu nftables.service | tail -n 10
-        return 1
-    fi
-}
-
-# --- 公共函数：打印规则表格 ---
+# --- 打印规则表格 ---
 # 参数 $1: 过滤模式 (all, enabled, paused)
 # 返回值: 0=有数据显示, 1=无数据显示
 show_rules_table() {
@@ -277,7 +150,7 @@ show_rules_table() {
     fi
 
     # 统一表头
-    printf "${YELLOW}%-4s %-8s %-10s %-12s %-16s %-12s %-12s %-s${NC}\n" "ID" "状态" "协议" "本地端口" "目标IP" "目标端口" "源IP限制" "备注"
+    printf "${YELLOW}%-4s %-8s %-10s %-12s %-16s %-12s %-12s %-s${NC}\n" "ID" "状态" "协议" "本机端口" "目标IP" "目标端口" "白名单" "备注"
     echo "------------------------------------------------------------------------------------------------"
 
     local i=1
@@ -324,19 +197,178 @@ show_rules_table() {
     return 0
 }
 
-# 1. 查看所有规则
+# --- 生成需要写入的规则 ---
+# 参数 $1: 生成模式 (dnat, forward)
+gen_nft_rule() {
+    local gen_mode=$1
+
+    # 读取数据库文件
+    while IFS='|' read -r lport backend_ip backend_port proto remark status whitelist; do
+        if [[ -n "$lport" ]]; then
+            # status: 1=启用, 0=暂停 (如果为空默认为1)
+            current_status=${status:-1}
+            remark_text=${remark:-无}
+            current_whitelist=${whitelist// /}
+            
+            # 只有当状态为 1 时才写入配置
+            if [ "$current_status" == "1" ]; then
+                # 在配置文件中添加注释，方便调试
+                echo "        # 备注: $remark_text"
+
+                # 处理白名单
+                limit_str=""
+                if [[ -n "$current_whitelist" ]]; then
+                    # 替换中文逗号为英文逗号
+                    safe_whitelist=${current_whitelist//，/,}
+
+                    # 判断字符串中是否包含逗号
+                    if [[ "$safe_whitelist" == *","* ]]; then
+                        # 包含逗号，视为 IP 列表，加上花括号
+                        limit_str="ip saddr { $safe_whitelist } "
+                    else
+                        # 不包含逗号，视为单个 IP 或 网段，不加花括号
+                        limit_str="ip saddr $safe_whitelist "
+                    fi
+                fi
+                
+                # fib daddr type local：去查询路由表（FIB），看看数据包的目标IP（daddr），是不是属于宿主机（PVE）自己的IP？ 只要目标IP是本机IP，就会被以下 DNAT 规则匹配和转发。
+                if [ "$proto" == "tcp+udp" ]; then
+                    if [ "$gen_mode" == "dnat" ]; then
+                        # prerouting dnat规则
+                        echo "        fib daddr type local ${limit_str}tcp dport $lport dnat to $backend_ip:$backend_port"
+                        echo "        fib daddr type local ${limit_str}udp dport $lport dnat to $backend_ip:$backend_port"
+                    else
+                        # forward accept规则
+                        echo "        ${limit_str}ip daddr $backend_ip tcp dport $backend_port ct state new accept"
+                        echo "        ${limit_str}ip daddr $backend_ip udp dport $backend_port ct state new accept"
+                    fi
+                else
+                    if [ "$gen_mode" == "dnat" ]; then
+                        # prerouting dnat规则
+                        echo "        fib daddr type local ${limit_str}$proto dport $lport dnat to $backend_ip:$backend_port"
+                    else
+                        # forward accept规则
+                        echo "        ${limit_str}ip daddr $backend_ip $proto dport $backend_port ct state new accept"
+                    fi
+                fi
+                
+                echo ""
+            fi
+        fi
+    done < "$DB_FILE"
+}
+
+# 核心函数：根据数据库生成 nftables 配置并应用，这将覆盖原有的 nftables.conf
+apply_rules() {
+    cat > "$NFT_CONF" <<EOF
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        
+EOF
+
+    # 获取 DNAT 规则并写入配置
+    rules_content=$(gen_nft_rule dnat)
+    if [[ -n "$rules_content" ]]; then
+        echo "$rules_content" >> "$NFT_CONF"
+    fi
+
+    cat >> "$NFT_CONF" <<EOF
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        
+        # 【关键：只对出公网的流量做伪装】
+        # 根据获取到的私有网段列表，设置只有当数据包从公网接口出去时，才把源IP改为宿主机IP的规则。
+EOF
+
+    # 私有网段访问公网的流量做伪装。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr oifname \"$WAN_IF\" masquerade" >> "$NFT_CONF"
+    done
+
+    cat >> "$NFT_CONF" <<EOF
+    }
+}
+
+table ip filter {
+    chain input { type filter hook input priority 0; policy accept; }
+    
+    chain forward { 
+        # 默认策略改为 drop (拒绝所有转发)
+        type filter hook forward priority 0; policy drop;
+        
+        # 允许已建立连接的回包（关键！），如果不加这句，回包会被拦截，转发也会断。
+        ct state established,related accept
+        
+        # 根据获取到的私有网段列表，设置互相访问和访问公网的规则。
+EOF
+
+    # 允许私有网段互相访问设置，如需禁止访问请删除。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr ip daddr $cidr ct state new accept" >> "$NFT_CONF"
+    done
+    echo "" >> "$NFT_CONF"
+
+    # 允许私有网段访问公网设置(无状态限制，适合网络测试)。
+    for cidr in $SUBNETS; do
+        echo "        ip saddr $cidr oifname \"$WAN_IF\" accept" >> "$NFT_CONF"
+    done
+    echo "" >> "$NFT_CONF"
+
+    # 获取 accept 规则并写入配置
+    rules_content=$(gen_nft_rule accept)
+    if [[ -n "$rules_content" ]]; then
+        echo "$rules_content" >> "$NFT_CONF"
+    fi
+
+    cat >> "$NFT_CONF" <<EOF
+    }
+    chain output { type filter hook output priority 0; policy accept; }
+}
+EOF
+
+    # 根据nftables服务状态选择不同命令
+    if systemctl is-active --quiet nftables; then
+        # 启动状态重载配置
+        systemctl reload nftables
+    else
+        # 停止状态重启服务
+        systemctl restart nftables
+    fi
+    
+    local error_status=$?
+    
+    if [ $error_status -eq 0 ]; then
+        echo -e "${GREEN}配置已更新并生效！${NC}"
+        return 0
+    else
+        echo -e "${RED}应用配置失败，请检查输入是否合法。${NC}"
+        # 输出错误日志最后几行帮助排查
+        echo -e "${YELLOW}错误详情 (journalctl):${NC}"
+        journalctl -xeu nftables.service | tail -n 10
+        return 1
+    fi
+}
+
+# 1. 查看所有转发
 list_rules() {
-    echo -e "\n${CYAN}=== 当前规则列表 ===${NC}"
+    echo -e "\n${CYAN}=== 当前所有端口转发规则列表 ===${NC}"
     show_rules_table "all"
 }
 
-# 2. 添加规则
+# 2. 添加端口转发
 add_rule() {
-    echo -e "\n${GREEN}>>> 新增转发规则${NC}"
+    echo -e "\n${GREEN}>>> 添加端口转发信息${NC}"
     
-    read -p "本地监听端口 (如 8080): " lport
-    read -p "后端真实 IP (如 192.168.1.20): " backend_ip
-    read -p "后端真实端口 (如 80): " backend_port
+    read -p "本机监听端口 (如 8080): " lport
+    read -p "目标IP (如 172.16.1.10): " backend_ip
+    read -p "目标端口 (如 80): " backend_port
     
     echo "协议类型:"
     echo "1) TCP"
@@ -351,12 +383,13 @@ add_rule() {
         *) echo -e "${RED}无效选择${NC}"; return ;;
     esac
 
-    read -p "备注说明 (选填，勿包含'|'符号): " user_remark
+    read -p "备注说明 (选填): " user_remark
     # 去除可能破坏格式的管道符
     user_remark=${user_remark//|/}
     
-    echo -e "\n${YELLOW}设置允许访问的源IP (白名单)${NC}"
-    echo "格式 = 1.1.1.1,192.168.1.0/24 (逗号分隔)；留空 = 允许所有IP。"
+    echo -e "\n${YELLOW}设置本机端口允许访问的IP (白名单)${NC}"
+    echo "格式 = 1.1.1.1,93.123.23.0/24 (逗号分隔)；留空 = 不限制。"
+    echo "白名单添加完成后，后期想查看白名单请查看 ${DB_FILE}"
     read -p "请输入: " whitelist_input
     whitelist_input=${whitelist_input// /}
     whitelist_input=${whitelist_input//|/}
@@ -378,12 +411,12 @@ add_rule() {
     }' "$DB_FILE")
 
     if [ "$conflict_check" == "1" ]; then
-        echo -e "${RED}错误：本地端口 $lport 协议冲突！${NC}"
+        echo -e "${RED}错误：本机端口 $lport 转发协议冲突！${NC}"
         echo -e "${YELLOW}提示：待添加的 端口+协议 与已存在的转发规则冲突，请勿重复添加。${NC}"
         return
     fi
     
-    # 备份原来配置
+    # 备份配置
     cp "$DB_FILE" "${DB_FILE}.bak"
     
     echo "$lport|$backend_ip|$backend_port|$proto|$user_remark|1|$whitelist_input" >> "$DB_FILE"
@@ -392,17 +425,20 @@ add_rule() {
     # 异常处理机制
     if [ $? -ne 0 ]; then
         echo -e "${YELLOW}>>> 检测到配置错误，正在自动回滚...${NC}"
-        mv "${DB_FILE}.bak" "$DB_FILE" # 恢复备份
-        apply_rules > /dev/null 2>&1   # 重新应用旧的正确配置
-        echo -e "${GREEN}回滚完成。新增规则已撤销，请检查服务是否正常运行。${NC}"
+        # 恢复备份
+        mv "${DB_FILE}.bak" "$DB_FILE"
+        # 应用备份的正确配置
+        apply_rules > /dev/null 2>&1
+        echo -e "${GREEN}回滚完成。新增的转发规则已撤销，请检查服务当前是否正常运行。${NC}"
     else
-        rm -f "${DB_FILE}.bak" # 成功则删除备份
+        # 成功则删除备份
+        rm -f "${DB_FILE}.bak"
     fi
 }
 
-# 内部函数：暂停规则
+# 内部函数：暂停转发
 pause_rule_logic() {
-    echo -e "\n${CYAN}>>> 暂停转发规则${NC}"
+    echo -e "\n${CYAN}>>> 暂停端口转发${NC}"
     echo -e "(仅显示当前正在【开启】的规则)"
     
     # 调用公共函数显示 "enabled" 的规则，并获取返回值
@@ -422,9 +458,9 @@ pause_rule_logic() {
     fi
 }
 
-# 内部函数：开启规则
+# 内部函数：开启转发
 enable_rule_logic() {
-    echo -e "\n${CYAN}>>> 开启转发规则${NC}"
+    echo -e "\n${CYAN}>>> 重新开启端口转发${NC}"
     echo -e "(仅显示当前已【暂停】的规则)"
     
     # 调用公共函数显示 "paused" 的规则，并获取返回值
@@ -444,11 +480,11 @@ enable_rule_logic() {
     fi
 }
 
-# 3. 管理规则状态（二级菜单）
+# 3. 管理转发状态 - 暂停/开启转发
 manage_state() {
-    echo -e "\n${YELLOW}>>> 管理规则状态${NC}"
-    echo "1. 暂停规则"
-    echo "2. 开启规则"
+    echo -e "\n${YELLOW}>>> 管理端口转发状态${NC}"
+    echo "1. 暂停转发"
+    echo "2. 开启转发"
     echo "3. 返回上级菜单"
     read -p "请选择操作 [1-3]: " sub_choice
     
@@ -460,9 +496,9 @@ manage_state() {
     esac
 }
 
-# 4. 删除规则
+# 4. 删除端口转发
 del_rule() {
-    echo -e "\n${RED}>>> 删除转发规则${NC}"
+    echo -e "\n${RED}>>> 删除端口转发${NC}"
     # 这里直接调用 all 模式，方便用户查看所有规则后选择删除
     if ! show_rules_table "all"; then
         return
@@ -484,7 +520,7 @@ restore_config() {
     echo -e "\n${YELLOW}>>> 正在恢复配置...${NC}"
     # 检查数据库是否有内容
     if [ ! -s "$DB_FILE" ]; then
-        echo -e "${RED}错误：数据库文件 (/etc/nat_rules.db) 为空或不存在，无法恢复。${NC}"
+        echo -e "${RED}错误：数据库文件 (${DB_FILE}) 为空或不存在，无法恢复。${NC}"
         echo -e "请先添加至少一条规则。"
         return
     fi
@@ -494,19 +530,18 @@ restore_config() {
 }
 
 # 主菜单
-setup_forwarding_env
 while true; do
-    echo -e "\n${CYAN}PVE 透明转发管理 (nftables)${NC}"
+    echo -e "\n${CYAN}PVE-NAT 端口转发管理${NC}"
     if systemctl is-active --quiet nftables; then
         nft_status="${GREEN}● 运行中${NC}"
     else
         nft_status="${RED}● 已停止${NC}"
     fi
-    echo -e "服务监控: ${nft_status}${NC}"
-    echo "1. 查看所有规则"
-    echo "2. 添加转发规则"
-    echo "3. 暂停/开启规则"
-    echo "4. 删除转发规则"
+    echo -e "nftables服务监控: ${nft_status}${NC}"
+    echo "1. 查看所有转发"
+    echo "2. 添加端口转发"
+    echo "3. 暂停/开启转发"
+    echo "4. 删除端口转发"
     echo "5. 恢复/重载配置"
     echo "6. 退出"
     read -p "请输入选项 [1-6]: " choice
